@@ -5,31 +5,31 @@ const axios = require('axios');
 const cors = require('cors');
 
 const app = express();
+
+// --- Required environment variables ---
 const REQUIRED_ENV_VARS = ['APP_SHARED_SECRET'];
 const OPTIONAL_ENV_VARS = ['STRIPE_SECRET_KEY'];
+
+// Check environment variables
 const missingEnv = REQUIRED_ENV_VARS.filter((key) => !process.env[key]);
 const missingOptionalEnv = OPTIONAL_ENV_VARS.filter((key) => !process.env[key]);
 
 if (missingEnv.length > 0) {
   console.error(
-    `Missing required environment variables: ${missingEnv.join(
-      ', '
-    )}. Please set them in your .env file.`
+    `❌ Missing required environment variables: ${missingEnv.join(', ')}`
   );
   process.exit(1);
 }
-
 if (missingOptionalEnv.length > 0) {
   console.warn(
-    `Optional environment variables not set: ${missingOptionalEnv.join(
-      ', '
-    )}.`
+    `⚠️ Optional environment variables not set: ${missingOptionalEnv.join(', ')}`
   );
 }
 
+// --- Config ---
 const PORT = Number(process.env.PORT) || 3000;
 const SHARED_SECRET = process.env.APP_SHARED_SECRET;
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || null;
 
 const APPLE_ENDPOINTS = {
   production: 'https://buy.itunes.apple.com/verifyReceipt',
@@ -47,18 +47,19 @@ const APPLE_STATUS_MESSAGES = {
   21008: 'This receipt is from the production environment. Retry against the production server.',
 };
 
+// --- Middleware ---
 app.use(express.json({ limit: '2mb' }));
 app.use(cors());
 
-// --- Logging middleware ---
+// --- Request logger ---
 app.use((req, res, next) => {
-  const requestTime = Date.now();
+  const start = Date.now();
   res.on('finish', () => {
-    const duration = Date.now() - requestTime;
+    const duration = Date.now() - start;
     console.log(
-      `[${new Date(requestTime).toISOString()}] ${req.method} ${
-        req.originalUrl
-      } -> ${res.statusCode} (${duration}ms)`
+      `[${new Date().toISOString()}] ${req.method} ${req.originalUrl} -> ${
+        res.statusCode
+      } (${duration}ms)`
     );
   });
   next();
@@ -67,46 +68,41 @@ app.use((req, res, next) => {
 const nowIso = () => new Date().toISOString();
 
 // --- Health check ---
-app.get('/status', (req, res) => {
+app.get('/status', (_req, res) => {
   res.json({
     success: true,
-    message: 'Aurora backend is running correctly.',
+    message: '✅ Aurora backend is running correctly.',
     timestamp: nowIso(),
   });
 });
 
-// --- Subscription status (stateless placeholder) ---
-app.get('/subscription/status', (req, res) => {
+// --- Subscription status (placeholder endpoint) ---
+app.get('/subscription/status', (_req, res) => {
   res.json({
     success: true,
     isPremium: false,
-    message: 'No subscription state stored on the server.',
+    message: '🧾 Subscription status endpoint active.',
     timestamp: nowIso(),
   });
 });
 
+// --- Utility: check active subscription ---
 const determineSubscriptionStatus = (latestReceiptInfo = []) => {
   if (!Array.isArray(latestReceiptInfo)) {
     return { isPremium: false, latestTransaction: null };
   }
 
-  const sortedByExpiry = [...latestReceiptInfo].sort((a, b) => {
-    const aExpiry = Number(a.expires_date_ms || 0);
-    const bExpiry = Number(b.expires_date_ms || 0);
-    return bExpiry - aExpiry;
-  });
+  const sorted = [...latestReceiptInfo].sort(
+    (a, b) => Number(b.expires_date_ms || 0) - Number(a.expires_date_ms || 0)
+  );
 
   const now = Date.now();
-  const mostRecent = sortedByExpiry[0] || null;
-  const active = sortedByExpiry.find((entry) => {
-    const expiresAt = Number(entry.expires_date_ms || 0);
-    return Number.isFinite(expiresAt) && expiresAt > now;
-  });
+  const mostRecent = sorted[0] || null;
+  const active = sorted.find(
+    (entry) => Number(entry.expires_date_ms || 0) > now
+  );
 
-  return {
-    isPremium: Boolean(active),
-    latestTransaction: mostRecent,
-  };
+  return { isPremium: Boolean(active), latestTransaction: mostRecent };
 };
 
 // --- Apple receipt validation ---
@@ -115,15 +111,12 @@ app.post('/verify-receipt', async (req, res) => {
   const receiptData =
     req.body['receipt-data'] || req.body.receiptData || req.body.receipt;
   const productId = req.body.productId;
-  const requestSandboxFlag = Boolean(req.body.isSandbox);
+  const isSandbox = Boolean(req.body.isSandbox);
 
   if (!receiptData) {
     return res.status(400).json({
       success: false,
-      isPremium: false,
-      status: 400,
-      message:
-        'Missing receipt data. Provide receipt-data, receiptData, or receipt in the JSON body.',
+      message: 'Missing receipt data.',
       timestamp,
     });
   }
@@ -134,22 +127,23 @@ app.post('/verify-receipt', async (req, res) => {
     'exclude-old-transactions': true,
   };
 
-  const attemptValidation = async (endpoint) =>
+  const attempt = (endpoint) =>
     axios.post(endpoint, requestBody, {
       headers: { 'Content-Type': 'application/json' },
       timeout: 10000,
     });
 
   try {
-    let endpoint = requestSandboxFlag
+    let endpoint = isSandbox
       ? APPLE_ENDPOINTS.sandbox
       : APPLE_ENDPOINTS.production;
-    let response = await attemptValidation(endpoint);
+    let response = await attempt(endpoint);
     let data = response.data;
 
+    // Retry if wrong environment
     if (data.status === 21007 && endpoint !== APPLE_ENDPOINTS.sandbox) {
-      console.log('Retrying receipt validation against the sandbox endpoint.');
-      response = await attemptValidation(APPLE_ENDPOINTS.sandbox);
+      console.log('🔁 Retrying receipt validation in sandbox environment...');
+      response = await attempt(APPLE_ENDPOINTS.sandbox);
       data = response.data;
     }
 
@@ -164,49 +158,39 @@ app.post('/verify-receipt', async (req, res) => {
         environment: data.environment,
         latestReceipt: data.latest_receipt || null,
         latestTransaction,
-        pendingRenewalInfo: data.pending_renewal_info || null,
         productId: productId || latestTransaction?.product_id || null,
         timestamp,
-        message: 'Receipt validated successfully.',
+        message: '✅ Receipt validated successfully.',
       });
     }
 
     const message =
       APPLE_STATUS_MESSAGES[data.status] ||
-      'Apple receipt validation failed with an unknown status.';
+      '❌ Apple receipt validation failed with unknown status.';
 
     return res.status(400).json({
       success: false,
       isPremium,
       status: data.status,
-      environment: data.environment || (requestSandboxFlag ? 'Sandbox' : null),
       message,
-      latestTransaction,
+      environment: data.environment || (isSandbox ? 'Sandbox' : 'Production'),
       timestamp,
     });
   } catch (error) {
-    const appleStatus = error.response?.data?.status;
-    const message =
-      error.response?.data?.message ||
-      APPLE_STATUS_MESSAGES[appleStatus] ||
-      error.message ||
-      'Unexpected error during receipt validation.';
-
+    console.error('❌ Error verifying receipt:', error.message);
     return res.status(500).json({
       success: false,
-      isPremium: false,
-      status: appleStatus || 'REQUEST_FAILED',
-      message,
+      message: error.message || 'Internal server error.',
       timestamp,
     });
   }
 });
 
 // --- 404 handler ---
-app.use((req, res) => {
+app.use((_req, res) => {
   res.status(404).json({
     success: false,
-    message: 'Endpoint not found',
+    message: 'Endpoint not found.',
     timestamp: nowIso(),
   });
 });
@@ -214,7 +198,7 @@ app.use((req, res) => {
 // --- Start server ---
 app.listen(PORT, () => {
   console.log(
-    `Aurora backend running on port ${PORT}. Stripe key configured: ${Boolean(
+    `⚡ Aurora backend running on port ${PORT}. Stripe configured: ${Boolean(
       STRIPE_SECRET_KEY
     )}`
   );
